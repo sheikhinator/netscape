@@ -43,7 +43,9 @@ def log(*a):
 
 
 def quantize(src, dst):
-    quantize_dynamic(src, dst, weight_type=QuantType.QInt8)
+    # Only MatMul/Gemm: quantising the ViT patch Conv produces ConvInteger, which ONNX Runtime's
+    # CPU provider (desktop and Android) can't run. Nearly all the weights are in MatMuls anyway.
+    quantize_dynamic(src, dst, weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul", "Gemm"])
     log(f"  {os.path.basename(dst)}: {os.path.getsize(src)/1e6:.1f} MB -> {os.path.getsize(dst)/1e6:.1f} MB")
 
 
