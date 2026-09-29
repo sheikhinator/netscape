@@ -22,6 +22,7 @@ import sys
 import zipfile
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import torch
 from onnxruntime.quantization import QuantType, quantize_dynamic
@@ -42,11 +43,58 @@ def log(*a):
     print("[pack]", *a, flush=True)
 
 
-def quantize(src, dst):
-    # Only MatMul/Gemm: quantising the ViT patch Conv produces ConvInteger, which ONNX Runtime's
-    # CPU provider (desktop and Android) can't run. Nearly all the weights are in MatMuls anyway.
-    quantize_dynamic(src, dst, weight_type=QuantType.QInt8, op_types_to_quantize=["MatMul", "Gemm"])
-    log(f"  {os.path.basename(dst)}: {os.path.getsize(src)/1e6:.1f} MB -> {os.path.getsize(dst)/1e6:.1f} MB")
+def fp16_weights(src, dst, min_elems=1024):
+    """Store large float32 weights as float16 and Cast them back to float32 at load time.
+    Half the size, and every op still computes in float32 — runs on any CPU, near-lossless."""
+    from onnx import TensorProto, helper, numpy_helper
+
+    m = onnx.load(src)
+    g = m.graph
+    casts, inits = [], []
+    for init in g.initializer:
+        if init.data_type == TensorProto.FLOAT and int(np.prod(init.dims)) >= min_elems:
+            h = numpy_helper.from_array(numpy_helper.to_array(init).astype(np.float16), init.name + "__fp16")
+            inits.append(h)
+            casts.append(helper.make_node("Cast", [h.name], [init.name], to=TensorProto.FLOAT, name=init.name + "__cast"))
+        else:
+            inits.append(init)
+    del g.initializer[:]
+    g.initializer.extend(inits)
+    nodes = list(g.node)
+    del g.node[:]
+    g.node.extend(casts + nodes)
+    onnx.save(m, dst)
+
+
+# Only MatMul/Gemm are quantised: quantising a Conv produces ConvInteger, which ONNX Runtime's
+# CPU provider (desktop and Android) can't run.
+MM = ["MatMul", "Gemm"]
+VARIANTS = [
+    ("int8 per-channel", lambda s, d: quantize_dynamic(s, d, weight_type=QuantType.QInt8, per_channel=True, op_types_to_quantize=MM)),
+    ("int8", lambda s, d: quantize_dynamic(s, d, weight_type=QuantType.QInt8, op_types_to_quantize=MM)),
+    ("fp16 weights", fp16_weights),
+]
+
+
+def compress(src, dst, score, need):
+    """Try the variants smallest-first; keep the first whose score (1.0 = identical to the
+    original PyTorch model) reaches `need`. fp16 weights is near-lossless, so it is the
+    guaranteed fallback; if even that falls short the build fails loudly."""
+    name = os.path.basename(dst)
+    for label, make in VARIANTS:
+        cand = dst + ".cand"
+        try:
+            make(src, cand)
+            got = score(cand)
+        except Exception as e:  # e.g. an op the runtime can't execute
+            log(f"  {name}: {label} unusable ({type(e).__name__}: {str(e)[:120]})")
+            continue
+        log(f"  {name}: {label} {os.path.getsize(src)/1e6:.0f} MB -> {os.path.getsize(cand)/1e6:.0f} MB, fidelity {got:.4f} (need {need})")
+        if got >= need:
+            os.replace(cand, dst)
+            return label
+        os.remove(cand)
+    raise SystemExit(f"{name}: no variant was accurate enough")
 
 
 def session(path):
@@ -105,14 +153,21 @@ torch.onnx.export(
     input_names=["pixel_values"], output_names=["logits"],
     dynamic_axes={"pixel_values": {0: "batch"}, "logits": {0: "batch"}}, opset_version=OPSET,
 )
-quantize(f32, os.path.join(PACK, "nsfw.onnx"))
+nsfw_inputs = {name: npp(images=Image.open(p).convert("RGB"), return_tensors="pt")["pixel_values"] for name, p in test_files}
+nsfw_torch = {name: softmax(nm(pixel_values=px).logits[0].numpy()) for name, px in nsfw_inputs.items()}
+
+
+def nsfw_score(path):
+    s = session(path)
+    worst = max(np.abs(softmax(s.run(None, {"pixel_values": px.numpy()})[0][0]) - nsfw_torch[n]).max() for n, px in nsfw_inputs.items())
+    return 1.0 - float(worst)
+
+
+compress(f32, os.path.join(PACK, "nsfw.onnx"), nsfw_score, need=0.9)
 ns = session(os.path.join(PACK, "nsfw.onnx"))
-for name, p in test_files:
-    px = npp(images=Image.open(p).convert("RGB"), return_tensors="pt")["pixel_values"]
-    torch_p = softmax(nm(pixel_values=px).logits[0].numpy())
+for name, px in nsfw_inputs.items():
     onnx_p = softmax(ns.run(None, {"pixel_values": px.numpy()})[0][0])
-    log(f"  {name}: torch {np.round(torch_p, 3)} int8 {np.round(onnx_p, 3)}")
-    assert np.abs(torch_p - onnx_p).max() < 0.15, "int8 NSFW model drifted too far from torch"
+    log(f"  {name}: torch {np.round(nsfw_torch[name], 3)} packed {np.round(onnx_p, 3)}")
     ref["images"].setdefault(name, {})["nsfw"] = {labels[i]: float(onnx_p[i]) for i in range(len(labels))}
 manifest["models"]["nsfw"] = {
     "file": "nsfw.onnx", "source": NSFW_ID, "labels": labels,
@@ -183,8 +238,6 @@ torch.onnx.export(
     input_names=["input_ids"], output_names=["text_embeds"],
     dynamic_axes={"input_ids": {0: "batch"}, "text_embeds": {0: "batch"}}, opset_version=OPSET,
 )
-quantize(v32, os.path.join(PACK, "clip_vision.onnx"))
-quantize(t32, os.path.join(PACK, "clip_text.onnx"))
 
 # CLIP BPE vocab + reference tokenizer from open_clip (the phone's tokenizer is a port of it)
 subprocess.check_call([sys.executable, "-m", "pip", "download", "-q", "--no-deps", "open_clip_torch==3.3.0", "-d", TMP])
@@ -215,7 +268,6 @@ def oc_ids(text):
 
 
 hf_tok = CLIPTokenizer.from_pretrained(CLIP_ID)
-vs, ts = session(os.path.join(PACK, "clip_vision.onnx")), session(os.path.join(PACK, "clip_text.onnx"))
 
 
 def norm(v):
@@ -223,35 +275,54 @@ def norm(v):
     return v / np.linalg.norm(v)
 
 
-prompts = ref["prompts"] + ["a photo of a couple in the bedroom", "a person wearing lingerie in the shower"]
-text_int8 = {}
+# Reference embeddings from the original PyTorch model (zero-padded ids, exactly as the phone sends)
+prompts = ref["prompts"] + [
+    "a photo of a couple in the bedroom", "a person wearing lingerie in the shower",
+    "a photo of a couple having sex in the Cowgirl position", "an explicit photo of Kissing",
+]
+prompt_ids = {pr: oc_ids(pr) for pr in prompts}
+text_torch = {}
 for pr in prompts:
-    ids = oc_ids(pr)
+    ids = prompt_ids[pr]
     hf = hf_tok(pr, padding="max_length", max_length=77, return_tensors="pt")["input_ids"]
     n_tok = int((ids[0] != 0).sum())
     same_ids = [int(x) for x in ids[0][:n_tok]] == [int(x) for x in hf[0][:n_tok]]
     torch_hf = norm(feats(cm.get_text_features(input_ids=hf)).numpy())
-    torch_oc = norm(feats(cm.get_text_features(input_ids=torch.from_numpy(ids))).numpy())
-    q = norm(ts.run(None, {"input_ids": ids})[0])
-    log(f"  text {pr!r}: ids match HF {same_ids}, hf-vs-zero-pad cos {torch_hf @ torch_oc:.5f}, int8 cos {q @ torch_oc:.4f}")
-    if not same_ids or torch_hf @ torch_oc < 0.999:
+    text_torch[pr] = norm(feats(cm.get_text_features(input_ids=torch.from_numpy(ids))).numpy())
+    log(f"  tokens {pr!r}: match HF {same_ids}, padding cos {torch_hf @ text_torch[pr]:.5f}")
+    if not same_ids or torch_hf @ text_torch[pr] < 0.999:
         log("  WARNING: open_clip ids / zero padding differ from HF — check the phone tokenizer")
-    assert q @ torch_oc > 0.9, "int8 text encoder drifted"
-    text_int8[pr] = q
+clip_inputs = {name: ip(images=Image.open(p).convert("RGB"), return_tensors="pt")["pixel_values"] for name, p in test_files}
+image_torch = {name: norm(feats(cm.get_image_features(pixel_values=px)).numpy()) for name, px in clip_inputs.items()}
 
-correct = 0
-for name, p in test_files:
-    px = ip(images=Image.open(p).convert("RGB"), return_tensors="pt")["pixel_values"]
-    torch_v = norm(feats(cm.get_image_features(pixel_values=px)).numpy())
+
+def text_score(path):
+    s = session(path)
+    return float(min(norm(s.run(None, {"input_ids": prompt_ids[pr]})[0]) @ text_torch[pr] for pr in prompts))
+
+
+def vision_score(path):
+    s = session(path)
+    return float(min(norm(s.run(None, {"pixel_values": px.numpy()})[0]) @ image_torch[n] for n, px in clip_inputs.items()))
+
+
+compress(v32, os.path.join(PACK, "clip_vision.onnx"), vision_score, need=0.97)
+compress(t32, os.path.join(PACK, "clip_text.onnx"), text_score, need=0.97)
+vs, ts = session(os.path.join(PACK, "clip_vision.onnx")), session(os.path.join(PACK, "clip_text.onnx"))
+text_packed = {pr: norm(ts.run(None, {"input_ids": prompt_ids[pr]})[0]) for pr in ref["prompts"]}
+
+agree = 0
+for name, px in clip_inputs.items():
     q = norm(vs.run(None, {"pixel_values": px.numpy()})[0])
-    sims = [float(q @ text_int8[pr]) for pr in ref["prompts"]]
-    probs = softmax(sims, 100)
-    top = ref["prompts"][int(np.argmax(probs))]
-    correct += int(name in top)
-    log(f"  image {name}: int8 cos {q @ torch_v:.4f}; zero-shot → {top!r} ({probs.max():.2f})")
-    assert q @ torch_v > 0.9, "int8 vision encoder drifted"
+    sims = [float(q @ text_packed[pr]) for pr in ref["prompts"]]
+    torch_sims = [float(image_torch[name] @ text_torch[pr]) for pr in ref["prompts"]]
+    top, torch_top = int(np.argmax(sims)), int(np.argmax(torch_sims))
+    agree += int(top == torch_top)
+    log(f"  image {name}: packed → {ref['prompts'][top]!r}, original → {ref['prompts'][torch_top]!r}")
     ref["images"].setdefault(name, {})["clip_sims"] = sims
-assert correct >= 3, f"CLIP zero-shot sanity check failed ({correct}/4 colours right)"
+# Fidelity above is the real gate; flat colour squares can score prompts almost equally.
+if agree < 4:
+    log(f"  note: packed and original CLIP pick different prompts on {4 - agree}/4 near-tied test images")
 
 manifest["models"]["clip"] = {
     "vision": "clip_vision.onnx", "text": "clip_text.onnx", "vocab": "clip_vocab.txt.gz", "source": CLIP_ID,
@@ -264,7 +335,7 @@ with open(os.path.join(PACK, "manifest.json"), "w") as f:
     json.dump(manifest, f, indent=2)
 with open(os.path.join(PACK, "LICENSES.txt"), "w") as f:
     f.write(
-        "Netscape AI pack — third-party models, used unmodified apart from ONNX export and int8 quantisation.\n\n"
+        "Netscape AI pack — third-party models, used unmodified apart from ONNX export and weight compression (int8 / fp16).\n\n"
         f"NSFW classifier: https://huggingface.co/{NSFW_ID} (see model card for licence)\n"
         "NudeNet: https://github.com/notAI-tech/NudeNet (MIT)\n"
         f"CLIP: https://huggingface.co/{CLIP_ID} (MIT)\n"
