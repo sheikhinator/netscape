@@ -1,0 +1,70 @@
+name: Build Netscape AI pack
+
+# Downloads the offline AI models from their official sources, converts them for phones,
+# checks them against the originals (Python) and against the app's own Kotlin code, then
+# publishes Netscape-AI-Pack.zip as a release you can download on your phone.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/ai/**'
+      - '.github/workflows/ai-pack.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install converters
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
+          pip install transformers==4.44.2 onnx==1.16.2 onnxruntime==1.19.2 \
+            nudenet==3.4.2 pillow numpy ftfy regex
+
+      - name: Build and verify models (Python)
+        run: python tools/ai/build_ai_pack.py out
+
+      - name: Unpack app source
+        run: |
+          mkdir -p _unpacked
+          unzip -q Netscape-source.zip -d _unpacked
+          echo "AI_SRC=$PWD/$(dirname "$(find _unpacked -path '*/com/netscape/vault/ai/Engines.kt' | head -n 1)")" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Verify the app's Kotlin AI code against the pack
+        working-directory: tools/ai/harness
+        run: |
+          gradle installDist --no-daemon -q -PaiSrc="$AI_SRC"
+          build/install/aiharness/bin/aiharness pack ../../../out/pack ../../../out/ref.json ../../../out/testimgs
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ai-pack-v1"
+          gh release create "$TAG" out/Netscape-AI-Pack.zip \
+            --title "Netscape AI pack" \
+            --notes "Offline AI models for Netscape. Download Netscape-AI-Pack.zip on your phone, then in the app go to Settings → AI Models → Install AI pack and pick the zip. Built from commit ${{ github.sha }}." \
+            || gh release upload "$TAG" out/Netscape-AI-Pack.zip --clobber
