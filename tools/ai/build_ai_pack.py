@@ -134,7 +134,8 @@ from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
 
 CLIP_ID = "openai/clip-vit-base-patch32"
 log("CLIP:", CLIP_ID)
-cm = CLIPModel.from_pretrained(CLIP_ID).eval()
+# "eager" attention: torch 2.4's ONNX exporter can't translate the SDPA path with a float scale.
+cm = CLIPModel.from_pretrained(CLIP_ID, attn_implementation="eager").eval()
 cp = CLIPProcessor.from_pretrained(CLIP_ID)
 ip = cp.image_processor
 c_size = int(ip.crop_size["height"]) if isinstance(ip.crop_size, dict) else int(ip.crop_size)
