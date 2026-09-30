@@ -6,6 +6,8 @@ Builds Netscape-AI-Pack.zip â€” the offline models the app loads from Settings â
   clip_vision.onnx   openai/clip-vit-base-patch32 image encoder, int8
   clip_text.onnx     openai/clip-vit-base-patch32 text encoder, int8
   clip_vocab.txt.gz  CLIP BPE merges (from open_clip)
+  smolvlm_q8.gguf   SmolVLM2-500M-Video-Instruct Q8_0 decoder
+  smolvlm_mmproj_q8.gguf  SmolVLM2 Q8_0 vision projector
   manifest.json      preprocessing + labels, so the phone never guesses
 
 Every model is checked against the original PyTorch / Python implementation before packing,
@@ -14,6 +16,7 @@ and reference outputs are written to <out>/ref.json for the Kotlin harness to co
 usage: python build_ai_pack.py <out_dir>
 """
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -120,7 +123,7 @@ for name, rgb in COLORS.items():
     test_files.append((name, p))
 ref = {"images": {}, "prompts": [f"a photo of a {c} square" for c in COLORS]}
 
-manifest = {"version": "1", "models": {}}
+manifest = {"version": "2", "models": {}}
 
 # ------------------------------------------------------------------ 1. NSFW classifier
 from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -330,6 +333,56 @@ manifest["models"]["clip"] = {
     "spec": {"size": c_size, "resize": "crop", "mean": list(ip.image_mean), "std": list(ip.image_std)},
 }
 
+# ------------------------------------------------------------------ 4. SmolVLM2 (GGUF + projector)
+# Pin the converted weights and verify their exact LFS content before publishing.
+from huggingface_hub import hf_hub_download
+
+VLM_ID = "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF"
+VLM_REVISION = "ccd7aae53bcb1997355c2f094959e72b3642ce17"
+VLM_FILES = [
+    (
+        "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        "smolvlm_q8.gguf",
+        436808704,
+        "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+    ),
+    (
+        "mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        "smolvlm_mmproj_q8.gguf",
+        108785184,
+        "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+    ),
+]
+log("SmolVLM2:", VLM_ID, "revision", VLM_REVISION)
+for source_name, pack_name, expected_size, expected_sha256 in VLM_FILES:
+    downloaded = hf_hub_download(
+        repo_id=VLM_ID,
+        filename=source_name,
+        revision=VLM_REVISION,
+    )
+    digest = hashlib.sha256()
+    size = 0
+    with open(downloaded, "rb") as src:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    if size != expected_size or digest.hexdigest() != expected_sha256:
+        raise SystemExit(
+            f"{source_name}: unexpected content ({size} bytes, sha256={digest.hexdigest()})"
+        )
+    shutil.copy2(downloaded, os.path.join(PACK, pack_name))
+    log(f"  verified {pack_name}: {size / 1e6:.1f} MB")
+manifest["models"]["smolvlm"] = {
+    "model": "smolvlm_q8.gguf",
+    "mmproj": "smolvlm_mmproj_q8.gguf",
+    "source": VLM_ID,
+    "revision": VLM_REVISION,
+    "quantization": "Q8_0",
+}
+
 # ------------------------------------------------------------------ pack
 with open(os.path.join(PACK, "manifest.json"), "w") as f:
     json.dump(manifest, f, indent=2)
@@ -340,6 +393,8 @@ with open(os.path.join(PACK, "LICENSES.txt"), "w") as f:
         "NudeNet: https://github.com/notAI-tech/NudeNet (MIT)\n"
         f"CLIP: https://huggingface.co/{CLIP_ID} (MIT)\n"
         "CLIP BPE vocabulary: https://github.com/mlfoundations/open_clip (MIT)\n"
+        f"SmolVLM2 GGUF: https://huggingface.co/{VLM_ID} (Apache-2.0; Q8_0 files pinned to {VLM_REVISION})\n"
+        "llama.cpp runtime: https://github.com/ggml-org/llama.cpp (MIT; see app build sources)\n"
     )
 with open(os.path.join(OUT, "ref.json"), "w") as f:
     json.dump(ref, f, indent=2)
@@ -347,7 +402,10 @@ with open(os.path.join(OUT, "ref.json"), "w") as f:
 zpath = os.path.join(OUT, "Netscape-AI-Pack.zip")
 with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
     for name in sorted(os.listdir(PACK)):
-        z.write(os.path.join(PACK, name), name)
+        compression = zipfile.ZIP_STORED if name.endswith(".gguf") else zipfile.ZIP_DEFLATED
+        z.write(os.path.join(PACK, name), name, compress_type=compression)
 log(f"wrote {zpath}: {os.path.getsize(zpath)/1e6:.1f} MB")
+if os.path.getsize(zpath) >= 1_000_000_000:
+    raise SystemExit("AI pack exceeds the 1 GB download limit")
 for name in sorted(os.listdir(PACK)):
     log(f"  {name}: {os.path.getsize(os.path.join(PACK, name))/1e6:.1f} MB")
