@@ -18,7 +18,11 @@ fun main(args: Array<String>) {
             "Spicy Categories" to listOf("Quickies"), "Age" to listOf("Adult"),
             "Positions" to listOf("Against the Wall"), "Setting & Place" to listOf("Car"),
             "Mood & Vibe" to listOf("Spontaneous")), emptyList()),
-        WriterPrompt.Item(true, 22 * 60_000L, "4K", 5, emptyMap(), emptyList())
+        WriterPrompt.Item(true, 22 * 60_000L, "4K", 5, emptyMap(), emptyList()),
+        // With notes from the scene model (plain, non-graphic) — the writer should build on them.
+        WriterPrompt.Item(true, 6 * 60_000L, "Full HD", 4, linkedMapOf(
+            "Heat Level" to listOf("Explicit"), "Who's In It" to listOf("Couple")), emptyList(),
+            scene = "A woman in a red satin robe sits on the edge of a hotel bed by a large window at night, warm lamp light. (Hotel, Lingerie, Dim Lighting)")
     )
     val refusal = Regex("""(?i)\b(I can(no|')t|I cannot|I'm sorry|I am sorry|as an AI|I won't|not able to (help|assist)|inappropriate)\b""")
     val writer = StoryWriter(args[0], threads = Runtime.getRuntime().availableProcessors().coerceAtMost(4))
