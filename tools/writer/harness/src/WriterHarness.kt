@@ -25,26 +25,33 @@ fun main(args: Array<String>) {
     var runs = 0
     var refusals = 0
     var malformed = 0
+    var rejected = 0
     for (voice in Voice.values()) {
         for ((i, item) in samples.withIndex()) {
             if (voice == Voice.MINIMAL && i > 1) continue
             val raw = writer.write(WriterPrompt.build(item, voice, 2), maxTokens = 200, seed = 42 + i)
             val st = writer.lastStats!!
-            val r = WriterPrompt.parse(raw)
+            val parsed = WriterPrompt.parse(raw)
+            // Same post-processing the app applies before anything is shown.
+            val accepted = WriterPrompt.isAcceptable(parsed)
+            val r = WriterPrompt.enforce(parsed, item, 2)
             runs++
             val ok = r.title.isNotBlank() && r.description.length >= 30
             if (!ok) malformed++
+            if (!accepted) rejected++
             if (refusal.containsMatchIn(raw)) refusals++
             val tps = if (st.millis > 0) st.tokens * 1000.0 / st.millis else 0.0
-            println("=== $voice · sample ${i + 1} · ${st.tokens} tokens · first token ${st.firstTokenMillis} ms · ${"%.1f".format(tps)} tok/s${if (!ok) " · MALFORMED" else ""}")
+            val flags = (if (!ok) " · MALFORMED" else "") + (if (!accepted) " · REJECTED (app rewrites it)" else "")
+            println("=== $voice · sample ${i + 1} · ${st.tokens} tokens · first token ${st.firstTokenMillis} ms · ${"%.1f".format(tps)} tok/s$flags")
             println("TITLE: ${r.title}")
             println("DESCRIPTION: ${r.description}")
         }
     }
     writer.close()
-    println("runs=$runs malformed=$malformed refusals=$refusals")
+    println("runs=$runs malformed=$malformed refusals=$refusals rejected=$rejected")
     // A couple of odd outputs from a 1.5B model are tolerable; refusals or broken formatting across the board are not.
-    if (refusals > 1 || malformed > runs / 5) {
+    // Rejected takes are rewritten by the app; if it happens often the user waits on retries.
+    if (refusals > 1 || malformed > runs / 5 || rejected > runs / 5) {
         println("WRITER CHECK FAILED")
         exitProcess(1)
     }
