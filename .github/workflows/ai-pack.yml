@@ -59,12 +59,29 @@ jobs:
           gradle installDist --no-daemon -q -PaiSrc="$AI_SRC"
           build/install/aiharness/bin/aiharness pack ../../../out/pack ../../../out/ref.json ../../../out/testimgs
 
-      - name: Publish release
+      - name: Publish release and verify the uploaded file
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -e
           TAG="ai-pack-v1"
-          gh release create "$TAG" out/Netscape-AI-Pack.zip \
-            --title "Netscape AI pack" \
-            --notes "Offline AI models for Netscape. Download Netscape-AI-Pack.zip on your phone, then in the app go to Settings → AI Models → Install AI pack and pick the zip. Built from commit ${{ github.sha }}." \
-            || gh release upload "$TAG" out/Netscape-AI-Pack.zip --clobber
+          SHA=$(cut -d' ' -f1 out/pack.sha256)
+          SIZE=$(stat -c %s out/Netscape-AI-Pack.zip)
+          MB=$(awk "BEGIN { printf \"%.1f\", $SIZE / 1000000 }")
+          NOTES="Offline AI models for Netscape.
+
+          1. Download Netscape-AI-Pack.zip on your phone and wait until the download has completely finished.
+          2. In the app: Settings → AI models → Install AI pack, and pick the zip.
+
+          The file is ${MB} MB (${SIZE} bytes). SHA-256: ${SHA}
+          The app checks every model inside it; if it says the pack is damaged, delete the download and get it again.
+
+          Built from commit ${{ github.sha }}."
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Netscape AI pack" --notes "$NOTES"
+          gh release upload "$TAG" out/Netscape-AI-Pack.zip --clobber
+          gh release edit "$TAG" --notes "$NOTES"
+          # Download what GitHub actually serves and make sure it is byte-identical.
+          gh release download "$TAG" -p Netscape-AI-Pack.zip -O published.zip --clobber
+          echo "$SHA  published.zip" | sha256sum -c -
+          python -c "import zipfile,sys; z=zipfile.ZipFile('published.zip'); bad=z.testzip(); sys.exit(f'corrupt entry {bad}' if bad else 0)"
+          echo "Published pack verified: $MB MB, sha256 $SHA"

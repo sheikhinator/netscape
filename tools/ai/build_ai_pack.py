@@ -123,7 +123,7 @@ for name, rgb in COLORS.items():
     test_files.append((name, p))
 ref = {"images": {}, "prompts": [f"a photo of a {c} square" for c in COLORS]}
 
-manifest = {"version": "2", "models": {}}
+manifest = {"version": "3", "models": {}}
 
 # ------------------------------------------------------------------ 1. NSFW classifier
 from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -384,8 +384,6 @@ manifest["models"]["smolvlm"] = {
 }
 
 # ------------------------------------------------------------------ pack
-with open(os.path.join(PACK, "manifest.json"), "w") as f:
-    json.dump(manifest, f, indent=2)
 with open(os.path.join(PACK, "LICENSES.txt"), "w") as f:
     f.write(
         "Netscape AI pack — third-party models, used unmodified apart from ONNX export and weight compression (int8 / fp16).\n\n"
@@ -396,16 +394,43 @@ with open(os.path.join(PACK, "LICENSES.txt"), "w") as f:
         f"SmolVLM2 GGUF: https://huggingface.co/{VLM_ID} (Apache-2.0; Q8_0 files pinned to {VLM_REVISION})\n"
         "llama.cpp runtime: https://github.com/ggml-org/llama.cpp (MIT; see app build sources)\n"
     )
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# Size + SHA-256 of every file, so the phone can prove each model arrived intact.
+payload = sorted(n for n in os.listdir(PACK) if n != "manifest.json")
+manifest["files"] = {
+    n: {"size": os.path.getsize(os.path.join(PACK, n)), "sha256": sha256_of(os.path.join(PACK, n))} for n in payload
+}
+with open(os.path.join(PACK, "manifest.json"), "w") as f:
+    json.dump(manifest, f, indent=2)
 with open(os.path.join(OUT, "ref.json"), "w") as f:
     json.dump(ref, f, indent=2)
 
+# manifest.json goes first. Model weights are stored, not deflated: they barely compress, and a
+# stored entry can't trip the phone's zlib decoder — damage shows up as a clear checksum error.
 zpath = os.path.join(OUT, "Netscape-AI-Pack.zip")
-with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-    for name in sorted(os.listdir(PACK)):
-        compression = zipfile.ZIP_STORED if name.endswith(".gguf") else zipfile.ZIP_DEFLATED
+with zipfile.ZipFile(zpath, "w") as z:
+    for name in ["manifest.json"] + payload:
+        compression = zipfile.ZIP_DEFLATED if name.endswith((".txt", ".json")) else zipfile.ZIP_STORED
         z.write(os.path.join(PACK, name), name, compress_type=compression)
+with zipfile.ZipFile(zpath) as z:
+    bad = z.testzip()
+    if bad:
+        raise SystemExit(f"zip self-check failed on {bad}")
+    if z.namelist()[0] != "manifest.json":
+        raise SystemExit("manifest.json must be the first entry")
 log(f"wrote {zpath}: {os.path.getsize(zpath)/1e6:.1f} MB")
 if os.path.getsize(zpath) >= 1_000_000_000:
     raise SystemExit("AI pack exceeds the 1 GB download limit")
-for name in sorted(os.listdir(PACK)):
+for name in ["manifest.json"] + payload:
     log(f"  {name}: {os.path.getsize(os.path.join(PACK, name))/1e6:.1f} MB")
+with open(os.path.join(OUT, "pack.sha256"), "w") as f:
+    f.write(f"{sha256_of(zpath)}  Netscape-AI-Pack.zip\n")
