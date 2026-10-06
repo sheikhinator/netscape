@@ -5,6 +5,11 @@ name: Build Netscape Writer pack
 # is in format and refusal-free, then publishes Netscape-Writer-Pack.zip and verifies the upload.
 on:
   workflow_dispatch:
+    inputs:
+      writer_model:
+        description: "Hugging Face repo to use (owner/name). Empty = most-downloaded abliterated Qwen2.5-1.5B-Instruct."
+        required: false
+        default: ""
   push:
     paths:
       - 'tools/writer/**'
@@ -57,6 +62,8 @@ jobs:
         run: pip install -r llama/requirements/requirements-convert_hf_to_gguf.txt huggingface_hub
 
       - name: Convert and package the writer
+        env:
+          WRITER_MODEL: ${{ github.event.inputs.writer_model }}
         run: python tools/writer/build_writer_pack.py llama "$QUANTIZE" out
 
       - name: Set up JDK 17

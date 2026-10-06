@@ -25,7 +25,8 @@ os.makedirs(PACK, exist_ok=True)
 os.makedirs(TMP, exist_ok=True)
 
 # Uncensored ("abliterated") Qwen2.5-1.5B-Instruct — Apache-2.0, like the base model.
-CANDIDATES = ["huihui-ai/Qwen2.5-1.5B-Instruct-abliterated"]
+# Set WRITER_MODEL=<owner/repo> to pin one; otherwise the most-downloaded match is used.
+PINNED = os.environ.get("WRITER_MODEL", "").strip()
 QUANT = "Q4_K_M"
 
 
@@ -42,16 +43,45 @@ def sha256_of(path):
 
 
 api = HfApi()
-repo = revision = None
-for cand in CANDIDATES:
+
+
+def usable(repo_id):
+    """Has a config and safetensors weights, i.e. something convert_hf_to_gguf can read."""
     try:
-        info = api.model_info(cand)
-        repo, revision = cand, info.sha
-        break
-    except Exception as e:  # not found / gated
-        log(f"{cand}: unavailable ({type(e).__name__})")
+        info = api.model_info(repo_id, files_metadata=False)
+    except Exception as e:
+        log(f"  {repo_id}: unavailable ({type(e).__name__})")
+        return None
+    names = {s.rfilename for s in (info.siblings or [])}
+    if "config.json" not in names or not any(n.endswith(".safetensors") for n in names):
+        log(f"  {repo_id}: no safetensors weights, skipped")
+        return None
+    return info
+
+
+repo = revision = None
+if PINNED:
+    info = usable(PINNED)
+    if not info:
+        raise SystemExit(f"WRITER_MODEL={PINNED} is not usable")
+    repo, revision = PINNED, info.sha
+else:
+    found = []
+    for query in ("Qwen2.5-1.5B-Instruct-abliterated", "Qwen2.5-1.5B-Instruct abliterated"):
+        for m in api.list_models(search=query, sort="downloads", direction=-1, limit=40):
+            name = m.id.lower()
+            if "qwen2.5-1.5b-instruct" in name and "abliterat" in name and "gguf" not in name \
+                    and not any(x in name for x in ("awq", "gptq", "exl2", "mlx", "bnb", "4bit", "8bit")):
+                found.append((m.downloads or 0, m.id))
+    candidates = [rid for _, rid in sorted(set(found), reverse=True)]
+    log("candidates (most downloaded first):", ", ".join(candidates) or "none")
+    for cand in candidates:
+        info = usable(cand)
+        if info:
+            repo, revision = cand, info.sha
+            break
 if not repo:
-    raise SystemExit("No writer model could be downloaded")
+    raise SystemExit("No abliterated Qwen2.5-1.5B-Instruct model with safetensors weights was found")
 log(f"model {repo} @ {revision}")
 
 src = snapshot_download(
