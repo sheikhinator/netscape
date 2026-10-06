@@ -1,0 +1,101 @@
+name: Build Netscape Writer pack
+
+# Converts the uncensored Qwen2.5-1.5B writer to GGUF with the exact llama.cpp commit the app
+# uses, runs the app's own writer code (C++ via JNI + Kotlin prompt) on it to check the output
+# is in format and refusal-free, then publishes Netscape-Writer-Pack.zip and verifies the upload.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/writer/**'
+      - '.github/workflows/writer-pack.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  writer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack app source
+        run: |
+          mkdir -p _unpacked
+          unzip -q Netscape-source.zip -d _unpacked
+          AI_SRC="$PWD/$(dirname "$(find _unpacked -path '*/com/netscape/vault/ai/StoryWriter.kt' | head -n 1)")"
+          CPP="$PWD/$(dirname "$(find _unpacked -path '*/src/main/cpp/writer_jni.cpp' | head -n 1)")"
+          SHA=$(grep -o 'llama.cpp/archive/[0-9a-f]*' "$CPP/CMakeLists.txt" | sed 's#.*/##')
+          echo "AI_SRC=$AI_SRC" >> "$GITHUB_ENV"
+          echo "WRITER_JNI=$CPP/writer_jni.cpp" >> "$GITHUB_ENV"
+          echo "LLAMA_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "llama.cpp commit: $SHA"
+
+      - name: Fetch llama.cpp (same commit as the app)
+        run: |
+          mkdir llama && cd llama
+          git init -q && git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_SHA" && git checkout -q FETCH_HEAD
+
+      - name: Build llama-quantize and the app's writer JNI for this machine
+        run: |
+          cmake -S tools/writer/host -B hostbuild -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_DIR="$PWD/llama" -DWRITER_JNI="$WRITER_JNI"
+          cmake --build hostbuild -j"$(nproc)" --target llama-quantize netscape_writer_host
+          echo "QUANTIZE=$(find "$PWD/hostbuild" -name llama-quantize -type f | head -n 1)" >> "$GITHUB_ENV"
+          echo "WRITER_LIB=$(find "$PWD/hostbuild" -name libnetscape_writer_host.so | head -n 1)" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install converter
+        run: pip install -r llama/requirements/requirements-convert_hf_to_gguf.txt huggingface_hub
+
+      - name: Convert and package the writer
+        run: python tools/writer/build_writer_pack.py llama "$QUANTIZE" out
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Run the app's writer on the real model
+        working-directory: tools/writer/harness
+        run: |
+          gradle installDist --no-daemon -q -PaiSrc="$AI_SRC"
+          JAVA_OPTS="-Dnetscape.nativeLib=$WRITER_LIB" build/install/writerharness/bin/writerharness ../../../out/pack/writer.gguf 2>/dev/null
+
+      - name: Publish release and verify the uploaded file
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="writer-pack-v1"
+          SHA=$(cut -d' ' -f1 out/pack.sha256)
+          SIZE=$(stat -c %s out/Netscape-Writer-Pack.zip)
+          MB=$(awk "BEGIN { printf \"%.1f\", $SIZE / 1000000 }")
+          NOTES="Optional offline AI writer for Netscape (Qwen2.5-1.5B, uncensored, runs on your phone).
+
+          1. Download Netscape-Writer-Pack.zip on your phone and wait until the download has completely finished.
+          2. In the app: Settings → AI writer → Install Writer pack, and pick the zip.
+
+          The file is ${MB} MB (${SIZE} bytes). SHA-256: ${SHA}
+
+          Built from commit ${{ github.sha }}."
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Netscape Writer pack" --notes "$NOTES"
+          gh release upload "$TAG" out/Netscape-Writer-Pack.zip --clobber
+          gh release edit "$TAG" --notes "$NOTES"
+          gh release download "$TAG" -p Netscape-Writer-Pack.zip -O published.zip --clobber
+          echo "$SHA  published.zip" | sha256sum -c -
+          echo "Published writer pack verified: $MB MB, sha256 $SHA"

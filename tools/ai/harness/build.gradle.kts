@@ -15,7 +15,7 @@ sourceSets {
     main {
         kotlin.srcDirs(aiSrc, "src")
         // AiService is the Android glue (Bitmap, Vault); everything else is plain Kotlin.
-        kotlin.exclude("**/AiService.kt")
+        kotlin.exclude("**/AiService.kt", "**/WriterService.kt")
     }
 }
 application { mainClass.set("HarnessKt") }
